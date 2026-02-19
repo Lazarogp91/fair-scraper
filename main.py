@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-app = FastAPI(title="Fair Scraper API", version="3.1.0")
+app = FastAPI(title="Fair Scraper API", version="3.2.0")
 
 
 class ScrapeRequest(BaseModel):
@@ -37,9 +37,10 @@ def want_country(country: str, allow: list[str]) -> bool:
 def is_manufacturer_strict(text: str) -> Tuple[bool, str, str]:
     """
     Devuelve: (is_manufacturer, confidence, evidence_snippet)
-    Estricto: si no hay evidencia, NO se considera fabricante.
+    Estricto: si no hay evidencia explícita -> NO fabricante.
     """
-    t = (text or "").lower()
+    raw = text or ""
+    t = raw.lower()
 
     positive_patterns = [
         r"\bfabricante\b",
@@ -76,128 +77,190 @@ def is_manufacturer_strict(text: str) -> Tuple[bool, str, str]:
         r"\bpartner\b",
     ]
 
-    # Si se declara explícitamente como distribuidor/integrador/servicios -> NO
+    # Si se declara integrador/servicios/distribuidor -> NO fabricante
     if any(re.search(p, t) for p in negative_patterns):
         return False, "Baja", ""
 
-    # Evidencia positiva explícita -> SÍ
+    # Evidencia positiva explícita -> fabricante
     for p in positive_patterns:
         m = re.search(p, t)
         if m:
-            start = max(0, m.start() - 60)
-            end = min(len(text), m.end() + 120)
-            snippet = clean_text(text[start:end])
+            start = max(0, m.start() - 70)
+            end = min(len(raw), m.end() + 140)
+            snippet = clean_text(raw[start:end])
             return True, "Alta", snippet
 
     return False, "Baja", ""
 
 
-def extract_container_id(payload: dict) -> Optional[int]:
-    """
-    Busca containerId en filtros tipo "(containerId: 2653)" o en params.
-    """
-    # caso directo
-    f = payload.get("filters")
-    if isinstance(f, str):
-        m = re.search(r"containerId\s*:\s*(\d+)", f)
-        if m:
-            return int(m.group(1))
-
-    # caso en params (string URL-encoded)
-    params = payload.get("params")
-    if isinstance(params, str):
-        m = re.search(r"containerId%3A\+(\d+)", params) or re.search(r"containerId:\+(\d+)", params)
-        if m:
-            return int(m.group(1))
-
+def extract_container_id_from_str(s: str) -> Optional[int]:
+    if not s:
+        return None
+    m = re.search(r"containerId\s*:\s*(\d+)", s)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"containerId%3A\+(\d+)", s)  # URL-encoded
+    if m:
+        return int(m.group(1))
     return None
 
 
 # -------------------------
-# Algolia detection by network sniffing (robusto)
+# Algolia detection (support /query and /queries)
 # -------------------------
 
-ALGOLIA_QUERY_RE = re.compile(r"/1/indexes/([^/]+)/query")
+def parse_algolia_multiqueries_body(body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Multi-queries típico:
+    {
+      "requests":[
+        {"indexName":"stands","params":"...filters=(containerId:+2653)...&page=0..."}
+      ]
+    }
+    """
+    requests_arr = body.get("requests")
+    if not isinstance(requests_arr, list) or not requests_arr:
+        return {}
+
+    best = None
+    best_score = -1
+    for req in requests_arr:
+        if not isinstance(req, dict):
+            continue
+        idx = req.get("indexName") or ""
+        params = req.get("params") or ""
+        score = 0
+        if isinstance(idx, str) and "stands" in idx.lower():
+            score += 10
+        if isinstance(params, str) and ("containerId" in params):
+            score += 5
+        if score > best_score:
+            best_score = score
+            best = req
+
+    if not best:
+        return {}
+
+    idx = best.get("indexName")
+    params = best.get("params", "")
+    container_id = extract_container_id_from_str(params if isinstance(params, str) else "")
+
+    if not idx or not container_id:
+        return {}
+    return {"indexName": idx, "containerId": container_id}
 
 
-def detect_algolia_from_network(url: str, timeout_ms: int = 15000) -> Dict[str, Any]:
+def detect_algolia_from_network(url: str, timeout_ms: int = 20000) -> Dict[str, Any]:
     """
-    Abre la web y captura la primera request POST a Algolia /query.
-    Devuelve {appId, apiKey, indexName, containerId, templatePayload}
+    Abre la web y captura requests a Algolia:
+      - /1/indexes/<index>/query
+      - /1/indexes/*/queries  (multi-queries, que es el caso de esta feria)
     """
-    captured = {"found": False}
     result: Dict[str, Any] = {}
+    captured_score = -1
+
+    def consider(app_id: str, api_key: str, index_name: str, container_id: Optional[int], score: int):
+        nonlocal result, captured_score
+        if not app_id or not api_key or not index_name or not container_id:
+            return
+        if score > captured_score:
+            captured_score = score
+            result = {
+                "appId": app_id,
+                "apiKey": api_key,
+                "indexName": index_name,
+                "containerId": int(container_id),
+            }
 
     def on_request(req):
         try:
             if req.method != "POST":
                 return
             u = req.url
-            if "algolia.net/1/indexes/" not in u or not u.endswith("/query"):
+            if "algolia.net/1/indexes/" not in u:
                 return
-
-            m = ALGOLIA_QUERY_RE.search(u)
-            if not m:
-                return
-            index_name = m.group(1)
-
-            # appId desde el host: <APPID>-dsn.algolia.net
-            host = urlparse(u).netloc
-            app_id = host.split("-")[0].upper() if "-" in host else ""
 
             headers = {k.lower(): v for k, v in (req.headers or {}).items()}
             api_key = headers.get("x-algolia-api-key", "")
-            hdr_app = headers.get("x-algolia-application-id", "")
-            if hdr_app:
-                app_id = hdr_app
+            app_id = headers.get("x-algolia-application-id", "")
+
+            # appId fallback desde host si no viene en header
+            host = urlparse(u).netloc
+            if not app_id and "-" in host:
+                app_id = host.split("-")[0].upper()
 
             post_data = req.post_data or ""
-            payload = {}
+            body = {}
             try:
-                payload = json.loads(post_data) if post_data else {}
+                body = json.loads(post_data) if post_data else {}
             except Exception:
-                payload = {}
+                body = {}
 
-            container_id = extract_container_id(payload)
+            # Caso 1: /query (indexName está en la URL)
+            if u.endswith("/query"):
+                m = re.search(r"/1/indexes/([^/]+)/query$", u)
+                if not m:
+                    return
+                index_name = m.group(1)
+                container_id = None
 
-            # guardamos la primera que parezca la buena (stands suele contener "stands")
-            score = 0
-            if "stands" in index_name.lower():
-                score += 10
-            if container_id:
-                score += 5
-            if api_key:
-                score += 2
+                # En /query puede venir filters o params
+                if isinstance(body, dict):
+                    container_id = extract_container_id_from_str(str(body.get("filters") or "")) or \
+                                   extract_container_id_from_str(str(body.get("params") or ""))
 
-            # si no hemos guardado ninguna o esta es mejor
-            prev_score = captured.get("score", -1)
-            if score > prev_score:
-                captured["score"] = score
-                captured["found"] = True
-                result.update(
-                    {
-                        "appId": app_id,
-                        "apiKey": api_key,
-                        "indexName": index_name,
-                        "containerId": container_id,
-                        "templatePayload": payload,
-                    }
-                )
+                score = 5
+                if "stands" in index_name.lower():
+                    score += 10
+                if container_id:
+                    score += 5
+                if api_key:
+                    score += 2
+
+                consider(app_id, api_key, index_name, container_id, score)
+                return
+
+            # Caso 2: /queries (multi-queries). indexName va dentro del body.requests[]
+            if u.endswith("/queries"):
+                parsed = parse_algolia_multiqueries_body(body if isinstance(body, dict) else {})
+                if not parsed:
+                    return
+
+                index_name = parsed["indexName"]
+                container_id = parsed["containerId"]
+
+                score = 8
+                if "stands" in index_name.lower():
+                    score += 10
+                if container_id:
+                    score += 5
+                if api_key:
+                    score += 2
+
+                consider(app_id, api_key, index_name, container_id, score)
+                return
+
         except Exception:
             return
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
+        browser = p.chromium.launch(headless=True, args=["--disable-dev-shm-usage"])
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            locale="es-ES",
+        )
         page = context.new_page()
         page.on("request", on_request)
 
         try:
-            page.goto(url, wait_until="networkidle", timeout=60000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # damos tiempo a que dispare el JS del catálogo
             page.wait_for_timeout(timeout_ms)
         except PWTimeoutError:
-            pass
-        except Exception:
             pass
         finally:
             try:
@@ -208,7 +271,6 @@ def detect_algolia_from_network(url: str, timeout_ms: int = 15000) -> Dict[str, 
     # validación mínima
     if not result.get("appId") or not result.get("apiKey") or not result.get("indexName") or not result.get("containerId"):
         return {}
-
     return result
 
 
@@ -233,29 +295,27 @@ def scrape_via_algolia(req: ScrapeRequest, conf: Dict[str, Any]) -> Dict[str, An
 
     allow = req.countries[:]
     exhibitors: List[Dict[str, Any]] = []
-    errors: List[str] = []
 
     page_num = 0
     nb_pages = 1
     hits_per_page = 15
 
     while page_num < nb_pages and page_num < req.max_pages:
-        payload = {
+        payload: Dict[str, Any] = {
             "query": "",
             "page": page_num,
             "hitsPerPage": hits_per_page,
             "facets": ["country", "categories.name"],
             "filters": f"(containerId: {container_id})",
         }
-        # filtro ES/PT directamente en Algolia (si el campo country existe)
+
+        # Filtrado por ES/PT en Algolia si el campo country está disponible
         if allow:
             payload["facetFilters"] = [[f"country:{c}" for c in allow]]
 
         data = algolia_query(app_id, api_key, index_name, payload)
-
         nb_pages = int(data.get("nbPages", 0) or 0)
         hits = data.get("hits", []) or []
-
         if not hits:
             break
 
@@ -268,7 +328,7 @@ def scrape_via_algolia(req: ScrapeRequest, conf: Dict[str, Any]) -> Dict[str, An
             if allow and not want_country(country, allow):
                 continue
 
-            # description (prioriza ES)
+            # description
             desc = ""
             d = h.get("description") or {}
             if isinstance(d, dict):
@@ -295,9 +355,9 @@ def scrape_via_algolia(req: ScrapeRequest, conf: Dict[str, Any]) -> Dict[str, An
                 {
                     "company_name": name,
                     "country": country,
-                    "description": desc[:700],
-                    "categories": cats[:10],
                     "standNumber": clean_text(h.get("standNumber") or ""),
+                    "categories": cats[:10],
+                    "description": desc[:700],
                     "manufacturer_confidence": conf_lvl,
                     "manufacturer_evidence": evidence,
                 }
@@ -314,32 +374,26 @@ def scrape_via_algolia(req: ScrapeRequest, conf: Dict[str, Any]) -> Dict[str, An
     return {
         "mode": "algolia",
         "algolia": {"indexName": index_name, "containerId": container_id},
+        "total": len(exhibitors),
         "exhibitors": exhibitors,
-        "errors": errors,
     }
 
-
-# -------------------------
-# Endpoint
-# -------------------------
 
 @app.post("/scrape")
 def scrape(req: ScrapeRequest):
     if not req.url.startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Invalid url")
 
-    # 1) Detectar Algolia por red (robusto)
     alg_conf = detect_algolia_from_network(req.url)
-    if alg_conf:
-        out = scrape_via_algolia(req, alg_conf)
-        out["source_url"] = req.url
-        out["total"] = len(out["exhibitors"])
-        return out
+    if not alg_conf:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No se ha detectado un catálogo tipo Algolia/Easyfairs desde la URL. "
+                "La web puede requerir login, bloquear scraping, o usar una API privada distinta."
+            ),
+        )
 
-    # 2) Si no detecta Algolia, devolvemos mensaje claro
-    # (Aquí podrías añadir más “drivers” para otros formatos: CSV, PDF, APIs, etc.)
-    raise HTTPException(
-        status_code=422,
-        detail="No se ha detectado un catálogo tipo Algolia/Easyfairs desde la URL. "
-               "La web puede requerir login, bloquear scraping, o usar una API privada distinta.",
-    )
+    out = scrape_via_algolia(req, alg_conf)
+    out["source_url"] = req.url
+    return out
