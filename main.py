@@ -1,40 +1,41 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+import json
+import asyncio
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, HttpUrl
+from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
-# ============================
-# FASTAPI APP (CRITICAL)
-# ============================
-app = FastAPI(title="Fair Scraper API", version="3.3.0")
+app = FastAPI(title="Fair Scraper API", version="3.2.0")
 
 
-# ============================
+# -----------------------------
 # Models
-# ============================
+# -----------------------------
 class ScrapeRequest(BaseModel):
-    url: str = Field(..., description="URL of the fair exhibitor catalog")
+    url: HttpUrl
     countries: List[str] = Field(default_factory=lambda: ["Spain", "Portugal"])
     manufacturers_only: bool = True
-    max_pages: int = Field(default=50, ge=1, le=500)
-    hits_per_page: int = Field(default=100, ge=10, le=200)
-    timeout_ms: int = Field(default=30000, ge=5000, le=120000)
+    max_pages: int = 50
+    deep_profile: bool = True  # kept for compatibility; in Algolia mode, hits already contain rich fields
+    sniff_timeout_ms: int = 25000  # time to wait for Algolia network call
 
 
-class ExhibitorOut(BaseModel):
+class CompanyOut(BaseModel):
     company: str
     country: Optional[str] = None
     fair_profile_url: Optional[str] = None
+    website: Optional[str] = None
     what_they_make: Optional[str] = None
     category: Optional[str] = None
-    evidence_manufacturer: str
-    confidence: str
-    sensors_potential: str
+    evidence: Optional[str] = None
+    confidence: str = "Baja"
+    sensor_potential: str = "Medio"
 
 
 class ScrapeResponse(BaseModel):
@@ -43,336 +44,392 @@ class ScrapeResponse(BaseModel):
     total_detected: int
     total_espt: int
     total_manufacturers: int
-    results: List[ExhibitorOut]
+    results: List[CompanyOut]
     debug: Dict[str, Any] = Field(default_factory=dict)
 
 
-# ============================
-# Minimal endpoints for sanity
-# ============================
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-
-# ============================
+# -----------------------------
 # Helpers
-# ============================
-def _base(url: str) -> str:
-    p = urlparse(url)
-    return f"{p.scheme}://{p.netloc}".rstrip("/")
+# -----------------------------
+MANUFACTURER_POSITIVE = [
+    "fabricante", "manufacturer", "manufacturing", "fabricación", "producción",
+    "oem", "diseñamos y producimos", "diseña y fabrica", "designs and manufactures",
+    "develops and manufactures", "in-house production", "producción propia",
+]
+MANUFACTURER_NEGATIVE = [
+    "distribuidor", "distribución", "reseller", "dealer",
+    "consultoría", "consulting", "servicios", "services",
+    "integrador", "system integrator", "integration", "implementación", "implementation",
+]
+
+SENSOR_HIGH = [
+    "rfid", "vision", "visión", "sensor", "sensores", "safety", "seguridad",
+    "automatización", "robot", "agv", "amr", "conveyor", "transportador",
+    "iot", "iiot", "track", "tracking", "trazabilidad",
+]
+SENSOR_LOW = ["consultoría", "consulting", "formación", "training", "marketing"]
 
 
-def _pick_text(desc: Any) -> str:
-    if desc is None:
-        return ""
-    if isinstance(desc, str):
-        return desc
-    if isinstance(desc, dict):
-        for k in ("es", "en", "pt"):
-            v = desc.get(k)
-            if isinstance(v, str) and v.strip():
-                return v
-        for v in desc.values():
-            if isinstance(v, str) and v.strip():
-                return v
-    return ""
+def normalize_exhibitors_url(url: str) -> str:
+    # Many Easyfairs exhibitor listings work better with sorting/pagination params.
+    # Keep original if it already has query.
+    if "?" in url:
+        return url
+    # If it's exactly /exhibitors/ without query, add a common sort param
+    if url.rstrip("/").endswith("/exhibitors"):
+        return url.rstrip("/") + "/?stands%5BsortBy%5D=stands_relevance"
+    return url
 
 
-def _manufacturer_evidence(text: str) -> tuple[bool, str, str]:
+def looks_like_manufacturer(text: str) -> Tuple[bool, str, str]:
     """
     Returns: (is_manu, evidence, confidence)
     """
     t = (text or "").lower()
 
-    pos = [
-        r"\bfabricante(s)?\b",
-        r"\bfabricaci[oó]n\b",
-        r"\bproducci[oó]n\b",
-        r"\bmanufacturer(s)?\b",
-        r"\bmanufacturing\b",
-        r"\bin[-\s]?house\s+production\b",
-        r"\bown\s+production\b",
-        r"\boem\b",
-        r"\bdiseñ(amos|a|an)\s+y\s+(fabricamos|producimos)\b",
-        r"\bwe\s+design\s+and\s+(manufacture|produce)\b",
-        r"\bwe\s+manufacture\b",
-    ]
-    neg = [
-        r"\bdistribuidor(a|es)?\b",
-        r"\breseller\b",
-        r"\bintegrador(a|es)?\b",
-        r"\bconsultor[ií]a\b",
-        r"\bservicios\b",
-    ]
+    pos_hits = [k for k in MANUFACTURER_POSITIVE if k in t]
+    neg_hits = [k for k in MANUFACTURER_NEGATIVE if k in t]
 
-    pos_hit = next((p for p in pos if re.search(p, t, re.IGNORECASE)), None)
-    neg_hit = next((n for n in neg if re.search(n, t, re.IGNORECASE)), None)
-
-    if pos_hit and not neg_hit:
-        return True, f"Keyword match: {pos_hit}", "Alta"
-    if pos_hit and neg_hit:
-        return False, f"Mixed signals (pos:{pos_hit}, neg:{neg_hit})", "Baja"
-    return False, "No explicit manufacturing evidence", "Baja"
+    if pos_hits and not neg_hits:
+        return True, f"Indicadores fabricante: {', '.join(pos_hits[:3])}", "Alta"
+    if pos_hits and neg_hits:
+        # conflicting signals
+        return True, f"Mixto (fabricante + servicios): {pos_hits[0]} / {neg_hits[0]}", "Media"
+    if not pos_hits and neg_hits:
+        return False, f"Indicadores NO fabricante: {', '.join(neg_hits[:2])}", "Alta"
+    return False, "Sin evidencia textual suficiente", "Baja"
 
 
-def _sensors_potential(categories: List[str], text: str) -> str:
-    blob = (" ".join(categories) + " " + (text or "")).lower()
-    high = ["rfid", "vision", "sensor", "automat", "robot", "agv", "intralog", "track", "trazab", "iot"]
-    if any(k in blob for k in high):
+def sensor_potential(text: str) -> str:
+    t = (text or "").lower()
+    if any(k in t for k in SENSOR_LOW):
+        return "Bajo"
+    if any(k in t for k in SENSOR_HIGH):
         return "Alto"
-    mid = ["software", "wms", "tms", "scm", "erp"]
-    if any(k in blob for k in mid):
-        return "Medio"
-    return "Bajo"
+    return "Medio"
 
 
-# ============================
-# Core scrape (ALGOLIA DIRECT)
-# ============================
-ALGOLIA_HOST_RE = re.compile(r"https://([a-z0-9\-]+)\.algolia\.net", re.IGNORECASE)
-ALGOLIA_APPID_RE = re.compile(r"\b([A-Z0-9]{8,12})\b")
-ALGOLIA_APIKEY_RE = re.compile(r"\b([a-zA-Z0-9]{24,64})\b")
-INDEX_RE = re.compile(r"\bstands_\d{8,12}\b")
-CONTAINERID_RE = re.compile(r"\bcontainerId\b[^0-9]{0,10}(\d{3,6})\b", re.IGNORECASE)
+def pick_lang(d: Any, preferred=("es", "en")) -> Optional[str]:
+    # Easyfairs often uses { "es": "...", "en": "..." }
+    if isinstance(d, dict):
+        for p in preferred:
+            v = d.get(p)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # fallback any string
+        for v in d.values():
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    if isinstance(d, str) and d.strip():
+        return d.strip()
+    return None
 
 
-async def _fetch_html(url: str, timeout_ms: int) -> str:
-    async with httpx.AsyncClient(timeout=timeout_ms / 1000.0, follow_redirects=True) as client:
-        r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        return r.text
+def safe_join(*parts: Optional[str], sep: str = " | ") -> str:
+    return sep.join([p.strip() for p in parts if isinstance(p, str) and p.strip()])
 
 
-def _extract_algolia_config(html: str) -> dict:
+# -----------------------------
+# Algolia sniffing
+# -----------------------------
+@dataclass
+class AlgoliaCapture:
+    app_id: Optional[str] = None
+    api_key: Optional[str] = None
+    index_name: Optional[str] = None
+    params: Optional[str] = None
+    container_id: Optional[int] = None
+    source_request_url: Optional[str] = None
+
+
+ALGOLIA_QUERIES_RE = re.compile(r"algolia\.(net|io)/1/indexes/.*/queries", re.IGNORECASE)
+
+
+def extract_container_id_from_params(params: str) -> Optional[int]:
+    # params contain filters=%28containerId%3A+2653%29 ...
+    m = re.search(r"containerId%3A\+(\d+)", params or "")
+    if m:
+        return int(m.group(1))
+    return None
+
+
+async def sniff_algolia_from_network(target_url: str, timeout_ms: int) -> AlgoliaCapture:
+    cap = AlgoliaCapture()
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=["--disable-blink-features=AutomationControlled"])
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+            )
+        )
+        page = await context.new_page()
+
+        async def on_request(req):
+            try:
+                url = req.url
+                if not ALGOLIA_QUERIES_RE.search(url):
+                    return
+
+                headers = {k.lower(): v for k, v in req.headers.items()}
+                app_id = headers.get("x-algolia-application-id")
+                api_key = headers.get("x-algolia-api-key")
+                if not app_id or not api_key:
+                    return
+
+                post = req.post_data
+                if not post:
+                    return
+                data = json.loads(post)
+
+                # Algolia "queries" uses {"requests":[{"indexName":"...","params":"..."}]}
+                requests = data.get("requests") or []
+                if not requests:
+                    return
+                first = requests[0]
+                index_name = first.get("indexName")
+                params = first.get("params")
+
+                if app_id and api_key and index_name and params:
+                    cap.app_id = app_id
+                    cap.api_key = api_key
+                    cap.index_name = index_name
+                    cap.params = params
+                    cap.container_id = extract_container_id_from_params(params)
+                    cap.source_request_url = url
+            except Exception:
+                return
+
+        page.on("request", on_request)
+
+        try:
+            await page.goto(target_url, wait_until="networkidle", timeout=timeout_ms)
+        except PWTimeoutError:
+            # still may have captured something
+            pass
+
+        await context.close()
+        await browser.close()
+
+    return cap
+
+
+# -----------------------------
+# Algolia querying
+# -----------------------------
+def patch_params_for_countries(params: str, countries: List[str]) -> str:
     """
-    Best-effort extraction from HTML/inline scripts.
+    Ensure facetFilters contains the requested countries (country:Spain, country:Portugal).
+    We replace/insert facetFilters=... keeping the rest.
     """
-    # indexName
-    idx = INDEX_RE.search(html)
-    index_name = idx.group(0) if idx else None
+    # Remove existing facetFilters=... (if any)
+    params_no_ff = re.sub(r"(?:^|&)facetFilters=[^&]*", "", params or "").strip("&")
 
-    # containerId
-    m = CONTAINERID_RE.search(html)
-    container_id = int(m.group(1)) if m else None
+    # Build new facetFilters. Algolia expects URL-encoded. We'll insert already encoded.
+    # For OR across countries: facetFilters=country%3ASpain%2Ccountry%3APortugal
+    encoded = "%2C".join([f"country%3A{httpx.QueryParams({'x': c})['x']}".replace("x=", "") for c in countries])
+    # Above is a safe-ish encode for spaces; but countries here are simple.
+    ff = f"facetFilters={encoded}"
 
-    # AppId + ApiKey (best-effort; often present in inline config)
-    # We do a slightly targeted search near "algolia" words
-    chunk = html
-    if "algolia" in html.lower():
-        # take a window around the first occurrence to reduce false positives
-        pos = html.lower().find("algolia")
-        chunk = html[max(0, pos - 20000): pos + 20000]
-
-    app_id = None
-    api_key = None
-
-    # Heuristic: look for patterns like appId:"XXXX", apiKey:"YYYY"
-    m_app = re.search(r'appId["\']?\s*[:=]\s*["\']([A-Z0-9]{8,12})["\']', chunk)
-    if m_app:
-        app_id = m_app.group(1)
-    m_key = re.search(r'apiKey["\']?\s*[:=]\s*["\']([a-zA-Z0-9]{24,64})["\']', chunk)
-    if m_key:
-        api_key = m_key.group(1)
-
-    # fallback: broad regex (can false positive; only if targeted search failed)
-    if not app_id:
-        cand = ALGOLIA_APPID_RE.findall(chunk)
-        # app id is usually uppercase+digits; take first
-        app_id = cand[0] if cand else None
-    if not api_key:
-        cand = ALGOLIA_APIKEY_RE.findall(chunk)
-        api_key = cand[0] if cand else None
-
-    return {
-        "index_name": index_name,
-        "container_id": container_id,
-        "app_id": app_id,
-        "api_key": api_key,
-    }
+    # If params already has "facets=" keep.
+    if params_no_ff:
+        return f"{ff}&{params_no_ff}"
+    return ff
 
 
-async def _algolia_query(
+async def algolia_fetch_all(
     app_id: str,
     api_key: str,
     index_name: str,
-    container_id: int,
+    base_params: str,
     countries: List[str],
-    page: int,
-    hits_per_page: int,
-    timeout_ms: int,
-) -> dict:
-    url = f"https://{app_id}-dsn.algolia.net/1/indexes/*/queries"
+    max_pages: int,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    params = patch_params_for_countries(base_params, countries)
+
+    endpoint = f"https://{app_id}-dsn.algolia.net/1/indexes/*/queries"
     headers = {
-        "X-Algolia-API-Key": api_key,
-        "X-Algolia-Application-Id": app_id,
-        "Content-Type": "application/json",
+        "x-algolia-application-id": app_id,
+        "x-algolia-api-key": api_key,
+        "content-type": "application/json",
     }
 
-    # facetFilters: country:Spain OR country:Portugal
-    facet_filters = [f"country:{c}" for c in countries]
+    all_hits: List[Dict[str, Any]] = []
+    debug: Dict[str, Any] = {"algolia_endpoint": endpoint, "index_name": index_name}
 
-    body = {
-        "requests": [
-            {
-                "indexName": index_name,
-                "params": httpx.QueryParams(
-                    {
-                        "query": "",
-                        "page": str(page),
-                        "hitsPerPage": str(hits_per_page),
-                        "facets": "categories.name,country",
-                        "maxValuesPerFacet": "100",
-                        "filters": f"(containerId: {container_id})",
-                        # OR filter for countries -> Algolia expects nested arrays for OR,
-                        # but many Easyfairs configs accept comma-separated facetFilters.
-                        "facetFilters": ",".join(facet_filters),
-                    }
-                ).__str__(),
-            }
-        ]
-    }
+    async with httpx.AsyncClient(timeout=30) as client:
+        page = 0
+        nb_pages = None
 
-    async with httpx.AsyncClient(timeout=timeout_ms / 1000.0, follow_redirects=True) as client:
-        r = await client.post(url, headers=headers, json=body)
-        r.raise_for_status()
-        return r.json()
+        while True:
+            if page >= max_pages:
+                break
+
+            # overwrite page param inside params
+            # remove any existing &page=...
+            p2 = re.sub(r"(?:^|&)page=\d+", "", params).strip("&")
+            p2 = f"{p2}&page={page}"
+
+            body = {"requests": [{"indexName": index_name, "params": p2}]}
+            r = await client.post(endpoint, headers=headers, json=body)
+            r.raise_for_status()
+            js = r.json()
+
+            # Algolia multi-queries returns {"results":[{...}]}
+            results = js.get("results") or []
+            if not results:
+                break
+            res0 = results[0]
+            hits = res0.get("hits") or []
+            all_hits.extend(hits)
+
+            nb_pages = res0.get("nbPages", nb_pages)
+            page += 1
+            if nb_pages is not None and page >= nb_pages:
+                break
+
+    debug["pages_fetched"] = page
+    debug["hits_total"] = len(all_hits)
+    return all_hits, debug
 
 
-def _normalize_hit(hit: dict, base: str) -> ExhibitorOut:
-    name = hit.get("name") or "Unknown"
-    country = hit.get("country")  # often present in Algolia hits
-    desc = _pick_text(hit.get("description"))
-    categories = []
-    for c in hit.get("categories") or []:
-        nm = c.get("name")
-        categories.append(_pick_text(nm))
+# -----------------------------
+# Normalization + filtering
+# -----------------------------
+def normalize_hit_to_company(hit: Dict[str, Any], base_domain: str) -> CompanyOut:
+    name = hit.get("name") or hit.get("company") or hit.get("title") or "Sin nombre"
+    country = hit.get("country") or hit.get("countryCode")  # Easyfairs Algolia often has "country"
+    stand_number = hit.get("standNumber")
 
-    # profile url in Easyfairs often present as "slug" somewhere; if not, build from objectID is impossible
-    # We will try to detect a likely path in hit if available
-    fair_profile_url = None
-    for k in ("url", "publicUrl", "profileUrl", "standUrl", "link"):
-        v = hit.get(k)
-        if isinstance(v, str) and v.startswith("http"):
-            fair_profile_url = v
-            break
-    if not fair_profile_url:
-        # sometimes it's relative
-        v = hit.get("slug")
-        if isinstance(v, str) and v:
-            fair_profile_url = f"{base}/es/exhibitors/{v}"
+    desc = pick_lang(hit.get("description")) or ""
+    cats = hit.get("categories") or []
+    cat_names = []
+    for c in cats:
+        n = pick_lang((c or {}).get("name"))
+        if n:
+            cat_names.append(n)
+    category = ", ".join(cat_names[:3]) if cat_names else None
 
-    is_manu, evidence, conf = _manufacturer_evidence(desc)
-    pot = _sensors_potential(categories, desc)
-
-    # what they make: a compact extraction from products if any, else first sentence of desc
     products = hit.get("products") or []
     prod_names = []
-    for p in products[:5]:
-        nm = p.get("name")
-        prod_names.append(_pick_text(nm))
-    what = ", ".join([x for x in prod_names if x]) if prod_names else (desc.split("\n")[0][:180] if desc else None)
+    for p in products:
+        pn = pick_lang((p or {}).get("name"))
+        if pn:
+            prod_names.append(pn)
 
-    cat = categories[0] if categories else None
+    what_make = None
+    if prod_names:
+        what_make = ", ".join(prod_names[:8])
+    elif desc:
+        what_make = (desc[:180] + "…") if len(desc) > 180 else desc
 
-    return ExhibitorOut(
+    # profile URL on Easyfairs websites is often /es/exhibitors/<slug>-<id>
+    obj_id = hit.get("objectID")
+    fair_profile_url = None
+    if obj_id:
+        # best effort: sometimes also "url" exists
+        if isinstance(hit.get("url"), str) and hit["url"].startswith("http"):
+            fair_profile_url = hit["url"]
+        else:
+            fair_profile_url = f"{base_domain.rstrip('/')}/es/exhibitors/{obj_id}"
+
+    # manufacturer inference
+    text_for_rules = safe_join(name, desc, category, what_make, stand_number)
+    is_manu, evidence, conf = looks_like_manufacturer(text_for_rules)
+
+    return CompanyOut(
         company=name,
         country=country,
         fair_profile_url=fair_profile_url,
-        what_they_make=what,
-        category=cat,
-        evidence_manufacturer=evidence,
+        website=hit.get("website") if isinstance(hit.get("website"), str) else None,
+        what_they_make=what_make,
+        category=category,
+        evidence=evidence,
         confidence=conf,
-        sensors_potential=pot,
-    )
+        sensor_potential=sensor_potential(text_for_rules),
+    ), is_manu
 
 
-# ============================
-# API endpoint
-# ============================
+def country_allowed(country: Optional[str], allowed: List[str]) -> bool:
+    if not country:
+        return False
+    return country.strip().lower() in {a.strip().lower() for a in allowed}
+
+
+# -----------------------------
+# Endpoint
+# -----------------------------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 @app.post("/scrape", response_model=ScrapeResponse)
 async def scrape(req: ScrapeRequest):
-    base = _base(req.url)
+    url = normalize_exhibitors_url(str(req.url))
 
-    # 1) Fetch HTML and extract config
-    try:
-        html = await _fetch_html(req.url, req.timeout_ms)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {e}")
+    # derive base domain (scheme + host)
+    m = re.match(r"^(https?://[^/]+)", url)
+    base_domain = m.group(1) if m else url
 
-    cfg = _extract_algolia_config(html)
-    debug: Dict[str, Any] = {"base": base, "detected": cfg}
+    # 1) Try Algolia via network sniffing
+    cap = await sniff_algolia_from_network(url, req.sniff_timeout_ms)
 
-    # If no Algolia config found, fail clearly (don’t pretend success)
-    if not cfg.get("index_name") or not cfg.get("container_id") or not cfg.get("app_id") or not cfg.get("api_key"):
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "error": "Algolia/Easyfairs config not detected from HTML. Site may load config via JS bundles or block bots.",
-                "detected": cfg,
-                "hint": "Try the full exhibitors URL with query params (page/sort) or allow the site in Render (bot protections).",
+    if cap.app_id and cap.api_key and cap.index_name and cap.params:
+        hits, dbg = await algolia_fetch_all(
+            app_id=cap.app_id,
+            api_key=cap.api_key,
+            index_name=cap.index_name,
+            base_params=cap.params,
+            countries=req.countries,
+            max_pages=req.max_pages,
+        )
+
+        results: List[CompanyOut] = []
+        total_espt = 0
+        total_manu = 0
+
+        for h in hits:
+            co, is_manu = normalize_hit_to_company(h, base_domain)
+            if not country_allowed(co.country, req.countries):
+                continue
+            total_espt += 1
+            if req.manufacturers_only and not is_manu:
+                continue
+            if is_manu:
+                total_manu += 1
+            results.append(co)
+
+        return ScrapeResponse(
+            status="ok",
+            mode="algolia_network_sniff",
+            total_detected=len(hits),
+            total_espt=total_espt,
+            total_manufacturers=total_manu if req.manufacturers_only else total_manu,
+            results=results,
+            debug={
+                "sniffed": {
+                    "app_id": cap.app_id,
+                    "index_name": cap.index_name,
+                    "container_id": cap.container_id,
+                    "source_request_url": cap.source_request_url,
+                },
+                **dbg,
             },
         )
 
-    # 2) Iterate pages
-    all_hits: List[dict] = []
-    total_pages_seen: Optional[int] = None
-
-    for page in range(req.max_pages):
-        data = await _algolia_query(
-            app_id=cfg["app_id"],
-            api_key=cfg["api_key"],
-            index_name=cfg["index_name"],
-            container_id=cfg["container_id"],
-            countries=req.countries,
-            page=page,
-            hits_per_page=req.hits_per_page,
-            timeout_ms=req.timeout_ms,
-        )
-        results = data.get("results") or []
-        if not results:
-            break
-
-        r0 = results[0]
-        hits = r0.get("hits") or []
-        if total_pages_seen is None:
-            total_pages_seen = r0.get("nbPages")
-
-        if not hits:
-            break
-
-        all_hits.extend(hits)
-
-        # stop when last page reached
-        nb_pages = r0.get("nbPages")
-        if isinstance(nb_pages, int) and page >= nb_pages - 1:
-            break
-
-    # 3) Normalize + filter manufacturers if requested
-    normalized: List[ExhibitorOut] = []
-    manu_count = 0
-
-    for h in all_hits:
-        item = _normalize_hit(h, base)
-        is_manu = item.confidence == "Alta" and "No explicit" not in item.evidence_manufacturer
-        if req.manufacturers_only:
-            if is_manu:
-                normalized.append(item)
-                manu_count += 1
-        else:
-            normalized.append(item)
-            if is_manu:
-                manu_count += 1
-
-    # total_espt = hits already filtered by country facetFilters, but keep metric
-    total_espt = len(all_hits)
-
-    return ScrapeResponse(
-        status="ok",
-        mode="algolia",
-        total_detected=len(all_hits),
-        total_espt=total_espt,
-        total_manufacturers=manu_count,
-        results=normalized,
-        debug=debug,
+    # 2) Fallback: couldn't sniff Algolia
+    raise HTTPException(
+        status_code=422,
+        detail={
+            "error": "Algolia/Easyfairs config not detected from network. Site may block bots or use another API.",
+            "detected": {
+                "index_name": cap.index_name,
+                "container_id": cap.container_id,
+                "app_id": cap.app_id,
+                "api_key": ("present" if cap.api_key else None),
+            },
+            "hint": "Si en tu navegador ves respuestas tipo Algolia (hits/nbPages/facets), aumenta sniff_timeout_ms o revisa bloqueos anti-bot en Render.",
+        },
     )
