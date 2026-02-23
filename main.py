@@ -1,3 +1,9 @@
+import os
+import subprocess
+
+# Instalar Chromium si no está instalado (solo primera vez)
+if not os.path.exists("/opt/render/project/.playwright"):
+    subprocess.run(["python", "-m", "playwright", "install", "chromium"])
 import re
 import json
 import time
