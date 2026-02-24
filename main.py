@@ -6,15 +6,15 @@ from pydantic import BaseModel, Field, HttpUrl
 from easyfairs_widgets import (
     is_easyfairs_supported,
     get_container_id_for_url,
-    fetch_easyfairs_stands,
+    fetch_easyfairs_stands_by_countries,
 )
 
-app = FastAPI(title="Fair Scraper API", version="1.0.0")
+app = FastAPI(title="Fair Scraper API", version="1.0.1")
 
 
 class ScrapeRequest(BaseModel):
     url: HttpUrl
-    countries: List[str] = Field(default_factory=list)
+    countries: List[str] = Field(default_factory=list)  # admite ["Spain","Portugal"] o ["ES","PT"] (ver normalización abajo)
     manufacturers_only: bool = True
     max_pages: int = 20
     timeout_ms: int = 25000
@@ -34,11 +34,41 @@ def health():
     return {"status": "ok"}
 
 
+def _normalize_countries(countries: List[str]) -> List[str]:
+    """
+    Normaliza códigos típicos a nombres que usa el facet de Easyfairs.
+    Ajustable según el catálogo.
+    """
+    if not countries:
+        return ["Spain", "Portugal"]
+
+    out: List[str] = []
+    for c in countries:
+        cc = (c or "").strip()
+        if not cc:
+            continue
+        u = cc.upper()
+        if u in ("ES", "ESP", "ESPAÑA", "SPAIN"):
+            out.append("Spain")
+        elif u in ("PT", "PRT", "PORTUGAL"):
+            out.append("Portugal")
+        else:
+            # si ya viene en formato correcto ("Spain", "Portugal", etc.)
+            out.append(cc)
+    # dedupe
+    seen = set()
+    uniq = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
 @app.post("/scrape", response_model=ScrapeResponse)
 def scrape(req: ScrapeRequest):
     url = str(req.url)
 
-    # 1) RUTA EASYFAIRS (la que acabamos de confirmar)
     if is_easyfairs_supported(url):
         container_id = get_container_id_for_url(url)
         if not container_id:
@@ -47,12 +77,14 @@ def scrape(req: ScrapeRequest):
                 detail="URL parece Easyfairs, pero no hay containerId en el mapping. Añádelo a EASYFAIRS_CONTAINER_MAP.",
             )
 
+        countries_norm = _normalize_countries(req.countries)
+
         try:
-            rows, meta = fetch_easyfairs_stands(
+            rows, meta = fetch_easyfairs_stands_by_countries(
                 event_url=url,
                 container_id=container_id,
+                countries=countries_norm,
                 lang="es",
-                # query_seed: se usa para “activar” resultados; puede ser "a" o vacío.
                 query_seed="a",
                 hits_per_page=100,
                 timeout_s=max(5, int(req.timeout_ms / 1000)),
@@ -61,7 +93,6 @@ def scrape(req: ScrapeRequest):
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Easyfairs widgets scrape failed: {e}")
 
-        # Normalizar salida EXACTA a lo que quieres (fabricante, actividad, web, país)
         out = []
         for r in rows:
             out.append(
@@ -75,8 +106,6 @@ def scrape(req: ScrapeRequest):
 
         return ScrapeResponse(url=url, total=len(out), results=out, meta=meta)
 
-    # 2) FALLBACK (si tienes otros scrapers, aquí enganchas tu lógica actual)
-    # Si no tienes nada más implementado aún, devolvemos error claro.
     raise HTTPException(
         status_code=400,
         detail=(
