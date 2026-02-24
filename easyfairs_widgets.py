@@ -1,237 +1,300 @@
+# easyfairs_widgets.py
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-EASYFAIRS_WIDGETS_STANDS_URL = "https://my.easyfairs.com/widgets/api/stands/?language={lang}"
-
-# Mapping dominio -> containerId (añade más ferias aquí)
+# =========================================================
+# Easyfairs containerId mapping (añade dominios aquí)
+# =========================================================
 EASYFAIRS_CONTAINER_MAP: Dict[str, int] = {
+    "www.logisticsautomationmadrid.com": 2653,
     "logisticsautomationmadrid.com": 2653,
 }
 
-DEFAULT_ALLOW_COUNTRIES = ["Spain", "Portugal"]
+EASYFAIRS_WIDGETS_BASE = "https://my.easyfairs.com"
+EASYFAIRS_STANDS_API = f"{EASYFAIRS_WIDGETS_BASE}/widgets/api/stands/?language={{lang}}"
+
+# Regex para detectar URLs en texto (incluye www.)
+_URL_RE = re.compile(
+    r"(?:(https?://)|\bwww\.)[a-zA-Z0-9\-._~%]+(?:\.[a-zA-Z]{2,})(?::\d+)?(?:/[^\s\"'<>)]*)?"
+)
+
+# Algunos falsos positivos típicos que conviene evitar
+_BAD_URL_ENDINGS = (".jpeg", ".jpg", ".png", ".gif", ".webp", ".svg", ".pdf")
 
 
-def _default_headers(origin: str, referer: str) -> Dict[str, str]:
-    return {
-        "Accept": "*/*",
-        "Content-Type": "application/json",
-        "Origin": origin,
-        "Referer": referer,
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-    }
+def get_container_id_for_url(event_url: str) -> Optional[int]:
+    """
+    Devuelve el containerId de una URL de feria Easyfairs según el dominio.
+    """
+    try:
+        host = urlparse(event_url).netloc.lower()
+    except Exception:
+        return None
+    return EASYFAIRS_CONTAINER_MAP.get(host)
 
 
-def _origin_from_url(event_url: str) -> str:
-    m = re.match(r"^(https?://[^/]+)", (event_url or "").strip())
-    return m.group(1) if m else ""
+def _extract_first_url(text: str) -> str:
+    """
+    Extrae la primera URL útil de un texto. Devuelve "" si no encuentra.
+    """
+    if not text:
+        return ""
+    for m in _URL_RE.finditer(text):
+        u = m.group(0).strip().rstrip(".,;:)")
+        # normaliza
+        if u.lower().endswith(_BAD_URL_ENDINGS):
+            continue
+        if u.startswith("www."):
+            u = "https://" + u
+        return u
+    return ""
 
 
-def _referer_from_url(event_url: str) -> str:
-    origin = _origin_from_url(event_url)
-    return origin + "/" if origin else ""
+def _categories_to_activity(hit: Dict[str, Any], lang: str) -> str:
+    cats = hit.get("categories") or []
+    out: List[str] = []
+    for c in cats:
+        name = (c.get("name") or {}).get(lang)
+        if name and name not in out:
+            out.append(name)
+    return ", ".join(out)
 
 
-def get_container_id_for_url(url: str) -> Optional[int]:
-    u = (url or "").lower()
-    for domain, cid in EASYFAIRS_CONTAINER_MAP.items():
-        if domain in u:
-            return cid
-    return None
+def _guess_website_from_hit(hit: Dict[str, Any], lang: str) -> str:
+    """
+    Best-effort para encontrar la web dentro del hit.
+    """
+    # campos típicos (dependen de implementación)
+    for k in ("website", "webSite", "url", "standUrl", "companyWebsite"):
+        v = hit.get(k)
+        if isinstance(v, str) and v.strip():
+            u = v.strip()
+            if u.startswith("www."):
+                u = "https://" + u
+            return u
+
+    # a veces está en description
+    desc = hit.get("description") or {}
+    if isinstance(desc, dict):
+        d = desc.get(lang) or desc.get("en") or ""
+    else:
+        d = str(desc)
+    u = _extract_first_url(d)
+    if u:
+        return u
+
+    return ""
 
 
-def _build_payload(
+def _post_algolia_widget(
+    session: requests.Session,
     *,
     container_id: int,
-    query: str,
+    lang: str,
+    query_seed: str,
     page: int,
     hits_per_page: int,
-    filters_extra: Optional[str] = None,
-    index_name: str = "stands_relevance",
-    facets: Optional[List[str]] = None,
-) -> List[Dict[str, Any]]:
-    if facets is None:
-        facets = ["categories.name", "country"]
+    country_filter: Optional[str],
+    timeout_s: int,
+) -> Dict[str, Any]:
+    """
+    Llama al endpoint widget de Easyfairs, que funciona como wrapper de Algolia.
+    """
+    url = EASYFAIRS_STANDS_API.format(lang=lang)
 
-    base_filters = f"(containerId: {container_id})"
-    final_filters = f"{base_filters} AND {filters_extra}" if filters_extra else base_filters
+    # Nota: el "filters" es sintaxis Algolia.
+    # En tu captura original era "(containerId: 2653)"
+    # Aquí añadimos AND country:"Spain" / "Portugal" cuando aplique.
+    filt = f"(containerId: {container_id})"
+    if country_filter:
+        # country facet usa valores como "Spain", "Portugal"
+        filt = f'{filt} AND country:"{country_filter}"'
 
-    return [
+    payload = [
         {
-            "indexName": index_name,
+            "indexName": "stands_relevance",
             "params": {
-                "facets": facets,
-                "filters": final_filters,
+                "facets": ["categories.name", "country"],
+                "filters": filt,
                 "highlightPostTag": "__/ais-highlight__",
                 "highlightPreTag": "__ais-highlight__",
                 "hitsPerPage": hits_per_page,
                 "maxValuesPerFacet": 100,
                 "page": page,
-                "query": query,
+                "query": query_seed,
             },
         }
     ]
 
-
-def _extract_activity(hit: Dict[str, Any], lang: str) -> str:
-    cats = hit.get("categories") or []
-    out: List[str] = []
-    for c in cats:
-        name = c.get("name")
-        if isinstance(name, dict):
-            v = name.get(lang) or name.get("en")
-            if isinstance(v, str) and v.strip():
-                out.append(v.strip())
-        elif isinstance(name, str) and name.strip():
-            out.append(name.strip())
-
-    # dedupe manteniendo orden
-    seen = set()
-    uniq = []
-    for x in out:
-        if x not in seen:
-            seen.add(x)
-            uniq.append(x)
-    return ", ".join(uniq)
+    r = session.post(url, json=payload, timeout=timeout_s)
+    r.raise_for_status()
+    data = r.json()
+    if not isinstance(data, dict) or "results" not in data or not data["results"]:
+        raise RuntimeError("Respuesta inesperada del endpoint Easyfairs widgets (sin 'results').")
+    return data["results"][0]
 
 
-def _extract_website(hit: Dict[str, Any]) -> str:
-    # campos posibles si vienen
-    for key in ("website", "url", "web", "companyUrl", "standUrl"):
-        v = hit.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
+def _try_fetch_stand_detail(
+    session: requests.Session,
+    *,
+    object_id: str,
+    lang: str,
+    timeout_s: int,
+) -> Optional[Dict[str, Any]]:
+    """
+    Deep profile: intenta obtener más datos del expositor con varios patrones.
+    Si no existe endpoint compatible, devuelve None sin romper.
+    """
+    # Estos patrones NO están garantizados; por eso es best-effort.
+    # Se prueban varios candidatos típicos.
+    candidates = [
+        f"{EASYFAIRS_WIDGETS_BASE}/widgets/api/stands/{object_id}/?language={lang}",
+        f"{EASYFAIRS_WIDGETS_BASE}/widgets/api/stands/{object_id}?language={lang}",
+        f"{EASYFAIRS_WIDGETS_BASE}/backend/api/stands/{object_id}?language={lang}",
+        f"{EASYFAIRS_WIDGETS_BASE}/backend/api/stands/{object_id}/?language={lang}",
+    ]
 
-    # fallback: buscar URL en la descripción
-    desc = hit.get("description")
-    text = ""
-    if isinstance(desc, dict):
-        text = desc.get("es") or desc.get("en") or ""
-    elif isinstance(desc, str):
-        text = desc
-
-    if isinstance(text, str) and text:
-        m = re.search(r"(https?://[^\s]+|www\.[^\s]+)", text)
-        if m:
-            return m.group(1).rstrip(").,;")
-    return ""
+    headers = {"Accept": "application/json"}
+    for u in candidates:
+        try:
+            rr = session.get(u, headers=headers, timeout=timeout_s)
+            if rr.status_code == 404:
+                continue
+            rr.raise_for_status()
+            j = rr.json()
+            if isinstance(j, dict):
+                return j
+        except Exception:
+            continue
+    return None
 
 
 def fetch_easyfairs_stands_by_countries(
     *,
     event_url: str,
     container_id: int,
-    countries: Optional[List[str]] = None,
+    countries: List[str],
     lang: str = "es",
     query_seed: str = "a",
     hits_per_page: int = 100,
-    timeout_s: int = 30,
-    polite_delay_s: float = 0.15,
-    max_pages: Optional[int] = None,
+    timeout_s: int = 25,
+    max_pages: Optional[int] = 5,
+    deep_profile: bool = False,
+    polite_delay_s: float = 0.0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Estrategia robusta para 'pais':
-    - Los hits no siempre incluyen el campo country.
-    - Pero el índice sí permite filtrar por country como facet.
-    - Hacemos queries separadas con filtro country:"Spain"/"Portugal" y etiquetamos el país
-      porque el filtro lo garantiza.
-
-    Devuelve filas normalizadas:
-      name, activity, website, country, object_id, stand_number, event_name
+    Devuelve (rows, meta)
+    rows: lista de dict con keys: objectID, name, activity, website, country
     """
-    if not countries:
-        countries = DEFAULT_ALLOW_COUNTRIES
-
-    origin = _origin_from_url(event_url)
-    referer = _referer_from_url(event_url)
-    headers = _default_headers(origin=origin, referer=referer)
-    api_url = EASYFAIRS_WIDGETS_STANDS_URL.format(lang=lang)
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": "Mozilla/5.0 (compatible; FairScraper/1.0; +https://example.com)",
+            "Origin": urlparse(event_url).scheme + "://" + urlparse(event_url).netloc,
+            "Referer": event_url,
+            "Accept": "application/json, text/plain, */*",
+        }
+    )
 
     all_rows: List[Dict[str, Any]] = []
-    seen_object_ids: set = set()
+    seen_object_ids = set()
 
-    pages_fetched_by_country: Dict[str, int] = {}
     hits_reported_by_country: Dict[str, int] = {}
+    pages_fetched_by_country: Dict[str, int] = {}
 
     for country in countries:
-        filters_extra = f'country:"{country}"'
+        page = 0
+        fetched_pages = 0
+        total_hits_reported = None
 
-        # página 0
-        payload0 = _build_payload(
-            container_id=container_id,
-            query=query_seed,
-            page=0,
-            hits_per_page=hits_per_page,
-            filters_extra=filters_extra,
-        )
-        r0 = requests.post(api_url, json=payload0, headers=headers, timeout=timeout_s)
-        r0.raise_for_status()
-        data0 = r0.json()
+        while True:
+            if max_pages is not None and fetched_pages >= max_pages:
+                break
 
-        results0 = data0.get("results") or []
-        if not results0:
-            pages_fetched_by_country[country] = 0
-            hits_reported_by_country[country] = 0
-            continue
+            res0 = _post_algolia_widget(
+                session,
+                container_id=container_id,
+                lang=lang,
+                query_seed=query_seed,
+                page=page,
+                hits_per_page=hits_per_page,
+                country_filter=country,
+                timeout_s=timeout_s,
+            )
 
-        block0 = results0[0]
-        nb_pages = int(block0.get("nbPages") or 1)
-        nb_hits = int(block0.get("nbHits") or 0)
-        if max_pages is not None:
-            nb_pages = min(nb_pages, max_pages)
+            if total_hits_reported is None:
+                # nbHits suele venir en el wrapper
+                nb_hits = res0.get("nbHits")
+                if isinstance(nb_hits, int):
+                    total_hits_reported = nb_hits
+                    hits_reported_by_country[country] = nb_hits
 
-        hits_reported_by_country[country] = nb_hits
+            hits = res0.get("hits") or []
+            if not hits:
+                break
 
-        def consume(hits: List[Dict[str, Any]]) -> None:
-            for hit in hits:
-                oid = str(hit.get("objectID") or "")
-                if oid and oid in seen_object_ids:
+            for h in hits:
+                oid = str(h.get("objectID") or "").strip()
+                if not oid:
                     continue
-                if oid:
-                    seen_object_ids.add(oid)
+                if oid in seen_object_ids:
+                    continue
+                seen_object_ids.add(oid)
+
+                name = (h.get("name") or "").strip()
+                activity = _categories_to_activity(h, lang=lang)
+
+                website = _guess_website_from_hit(h, lang=lang)
+
+                # Deep profile: si falta web, intenta detalle
+                if deep_profile and not website:
+                    detail = _try_fetch_stand_detail(session, object_id=oid, lang=lang, timeout_s=timeout_s)
+                    if detail:
+                        # intenta campos típicos y fallback a texto
+                        for k in ("website", "webSite", "url", "companyWebsite"):
+                            v = detail.get(k)
+                            if isinstance(v, str) and v.strip():
+                                website = v.strip()
+                                if website.startswith("www."):
+                                    website = "https://" + website
+                                break
+                        if not website:
+                            # a veces el detalle lleva description también
+                            ddesc = detail.get("description")
+                            if isinstance(ddesc, dict):
+                                dd = ddesc.get(lang) or ddesc.get("en") or ""
+                            else:
+                                dd = str(ddesc or "")
+                            website = _extract_first_url(dd)
 
                 all_rows.append(
                     {
-                        "name": (hit.get("name") or "").strip(),
-                        "activity": _extract_activity(hit, lang),
-                        "website": _extract_website(hit),
-                        "country": country,  # garantizado por el filtro
-                        "object_id": oid,
-                        "stand_number": str(hit.get("standNumber") or ""),
-                        "event_name": str(hit.get("eventName") or ""),
+                        "objectID": oid,
+                        "name": name,
+                        "activity": activity,
+                        "website": website,
+                        "country": country,
                     }
                 )
 
-        consume(block0.get("hits") or [])
+            fetched_pages += 1
+            page += 1
 
-        pages_fetched = 1
-
-        # resto de páginas
-        for page in range(1, nb_pages):
-            time.sleep(polite_delay_s)
-            payload = _build_payload(
-                container_id=container_id,
-                query=query_seed,
-                page=page,
-                hits_per_page=hits_per_page,
-                filters_extra=filters_extra,
-            )
-            rp = requests.post(api_url, json=payload, headers=headers, timeout=timeout_s)
-            rp.raise_for_status()
-            dp = rp.json()
-            rsp = dp.get("results") or []
-            if not rsp:
+            # si ya cubrimos todas las páginas, paramos
+            nb_pages = res0.get("nbPages")
+            if isinstance(nb_pages, int) and page >= nb_pages:
                 break
-            consume((rsp[0].get("hits") or []))
-            pages_fetched += 1
 
-        pages_fetched_by_country[country] = pages_fetched
+            if polite_delay_s > 0:
+                time.sleep(polite_delay_s)
+
+        pages_fetched_by_country[country] = fetched_pages
 
     meta = {
         "source": "easyfairs_widgets",
@@ -242,6 +305,7 @@ def fetch_easyfairs_stands_by_countries(
         "hits_reported_by_country": hits_reported_by_country,
         "pages_fetched_by_country": pages_fetched_by_country,
         "dedupe_by_objectID": True,
+        "deep_profile": bool(deep_profile),
     }
 
     return all_rows, meta
