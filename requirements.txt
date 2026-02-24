@@ -2,3 +2,4 @@ fastapi
 uvicorn[standard]
 playwright
 requests
+pydantic
