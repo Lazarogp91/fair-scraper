@@ -1,9 +1,8 @@
 # main.py
 from __future__ import annotations
 
-from typing import List, Any, Dict
+from typing import List, Optional, Any, Dict, Tuple
 from io import BytesIO
-from datetime import datetime
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -11,9 +10,9 @@ from pydantic import BaseModel, Field, HttpUrl
 
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
-from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from easyfairs_widgets import (
+    is_easyfairs_supported,
     get_container_id_for_url,
     fetch_easyfairs_stands_by_countries,
 )
@@ -44,6 +43,9 @@ def health():
 
 
 def _normalize_countries(countries: List[str]) -> List[str]:
+    """
+    Normaliza códigos típicos a nombres que usa el facet de Easyfairs.
+    """
     if not countries:
         return ["Spain", "Portugal"]
 
@@ -60,8 +62,9 @@ def _normalize_countries(countries: List[str]) -> List[str]:
         else:
             out.append(cc)
 
+    # dedupe preservando orden
     seen = set()
-    uniq = []
+    uniq: List[str] = []
     for x in out:
         if x not in seen:
             seen.add(x)
@@ -69,59 +72,19 @@ def _normalize_countries(countries: List[str]) -> List[str]:
     return uniq
 
 
-def _scrape_impl(req: ScrapeRequest) -> ScrapeResponse:
-    url = str(req.url)
-
-    container_id = get_container_id_for_url(url)
-    if container_id is None:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Esta URL no está en el mapping Easyfairs (dominio->containerId). "
-                "Añádela en EASYFAIRS_CONTAINER_MAP en easyfairs_widgets.py"
-            ),
-        )
-
-    countries_norm = _normalize_countries(req.countries)
-
-    try:
-        rows, meta = fetch_easyfairs_stands_by_countries(
-            event_url=url,
-            container_id=container_id,
-            countries=countries_norm,
-            lang="es",
-            query_seed="a",
-            hits_per_page=100,
-            timeout_s=max(5, int(req.timeout_ms / 1000)),
-            max_pages=req.max_pages if req.max_pages and req.max_pages > 0 else None,
-            deep_profile=bool(req.deep_profile),
-            polite_delay_s=0.0,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Easyfairs widgets scrape failed: {e}")
-
-    results = [
-        {
-            "fabricante": r.get("name", "") or "",
-            "actividad": r.get("activity", "") or "",
-            "enlace_web": r.get("website", "") or "",
-            "pais": r.get("country", "") or "",
-        }
-        for r in rows
-    ]
-
-    return ScrapeResponse(url=url, total=len(results), results=results, meta=meta)
-
-
-def _build_excel(results: List[Dict[str, Any]], *, sheet_name: str = "Fabricantes") -> bytes:
+def _rows_to_excel_bytes(url: str, rows: List[Dict[str, Any]]) -> bytes:
+    """
+    Genera un .xlsx en memoria con columnas:
+    Fabricante | Actividad | Enlace Web | País
+    """
     wb = Workbook()
     ws = wb.active
-    ws.title = sheet_name
+    ws.title = "Fabricantes"
 
     headers = ["Fabricante", "Actividad", "Enlace Web", "País"]
     ws.append(headers)
 
-    for r in results:
+    for r in rows:
         ws.append(
             [
                 r.get("fabricante", "") or "",
@@ -131,59 +94,82 @@ def _build_excel(results: List[Dict[str, Any]], *, sheet_name: str = "Fabricante
             ]
         )
 
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{ws.max_row}"
+    # Formato mínimo: ancho de columnas
+    for col_idx, h in enumerate(headers, start=1):
+        max_len = len(h)
+        for row_idx in range(2, ws.max_row + 1):
+            val = ws.cell(row=row_idx, column=col_idx).value
+            if val is None:
+                continue
+            max_len = max(max_len, len(str(val)))
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(60, max(12, max_len + 2))
 
-    tab = Table(displayName="TablaFabricantes", ref=f"A1:{get_column_letter(len(headers))}{ws.max_row}")
-    tab.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium9",
-        showFirstColumn=False,
-        showLastColumn=False,
-        showRowStripes=True,
-        showColumnStripes=False,
-    )
-    ws.add_table(tab)
-
-    # Hipervínculos + ancho columnas
-    col_widths = [len(h) for h in headers]
-    for row_idx in range(2, ws.max_row + 1):
-        cell = ws.cell(row=row_idx, column=3)
-        val = (cell.value or "").strip()
-        if val:
-            url = val
-            if url.startswith("www."):
-                url = "https://" + url
-            if url.startswith("http://") or url.startswith("https://"):
-                cell.hyperlink = url
-                cell.style = "Hyperlink"
-
-        for col_idx in range(1, len(headers) + 1):
-            v = ws.cell(row=row_idx, column=col_idx).value
-            v = "" if v is None else str(v)
-            col_widths[col_idx - 1] = max(col_widths[col_idx - 1], min(len(v), 80))
-
-    for i, w in enumerate(col_widths, start=1):
-        ws.column_dimensions[get_column_letter(i)].width = max(12, min(w + 2, 60))
-
+    # Guardar a bytes
     bio = BytesIO()
     wb.save(bio)
     return bio.getvalue()
 
 
-def _excel_filename(prefix: str = "fabricantes") -> str:
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return f"{prefix}_{ts}.xlsx"
+def _scrape_logic(req: ScrapeRequest) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    url = str(req.url)
+
+    if not is_easyfairs_supported(url):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Esta URL no está soportada como Easyfairs Widgets. "
+                "Si es otra feria Easyfairs, añade el dominio->containerId en el mapping."
+            ),
+        )
+
+    container_id = get_container_id_for_url(url)
+    if not container_id:
+        raise HTTPException(
+            status_code=400,
+            detail="URL parece Easyfairs, pero no hay containerId en el mapping. Añádelo a EASYFAIRS_CONTAINER_MAP.",
+        )
+
+    countries_norm = _normalize_countries(req.countries)
+
+    try:
+        rows_raw, meta = fetch_easyfairs_stands_by_countries(
+            event_url=url,
+            container_id=container_id,
+            countries=countries_norm,
+            lang="es",
+            query_seed="a",
+            hits_per_page=100,
+            timeout_s=max(5, int(req.timeout_ms / 1000)),
+            max_pages=req.max_pages if req.max_pages > 0 else None,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Easyfairs widgets scrape failed: {e}")
+
+    # Transformación a tu formato
+    out: List[Dict[str, Any]] = []
+    for r in rows_raw:
+        out.append(
+            {
+                "fabricante": r.get("name", "") or "",
+                "actividad": r.get("activity", "") or "",
+                "enlace_web": r.get("website", "") or "",
+                "pais": r.get("country", "") or "",
+            }
+        )
+
+    return out, meta
 
 
 @app.post("/scrape")
-def scrape_excel_always(req: ScrapeRequest):
+def scrape_excel(req: ScrapeRequest):
     """
-    SIEMPRE devuelve un Excel.
+    Devuelve SIEMPRE Excel binario (.xlsx)
     """
-    resp = _scrape_impl(req)
-    xlsx_bytes = _build_excel(resp.results)
+    rows, meta = _scrape_logic(req)
 
-    filename = _excel_filename("fabricantes")
+    xlsx_bytes = _rows_to_excel_bytes(str(req.url), rows)
+    filename = "fabricantes_es_pt.xlsx"
+
     return StreamingResponse(
         BytesIO(xlsx_bytes),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -194,6 +180,7 @@ def scrape_excel_always(req: ScrapeRequest):
 @app.post("/scrape_json", response_model=ScrapeResponse)
 def scrape_json(req: ScrapeRequest):
     """
-    Endpoint opcional para depurar: devuelve JSON.
+    Endpoint opcional que devuelve JSON
     """
-    return _scrape_impl(req)
+    rows, meta = _scrape_logic(req)
+    return ScrapeResponse(url=str(req.url), total=len(rows), results=rows, meta=meta)
