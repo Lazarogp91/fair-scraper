@@ -1,20 +1,19 @@
 # main.py
-from typing import List, Optional, Any, Dict
+from typing import List, Any, Dict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
 
 from easyfairs_widgets import (
-    is_easyfairs_supported,
     get_container_id_for_url,
     fetch_easyfairs_stands_by_countries,
 )
 
-app = FastAPI(title="Fair Scraper API", version="1.0.1")
+app = FastAPI(title="Fair Scraper API", version="1.0.2")
 
 
 class ScrapeRequest(BaseModel):
     url: HttpUrl
-    countries: List[str] = Field(default_factory=list)  # admite ["Spain","Portugal"] o ["ES","PT"] (ver normalización abajo)
+    countries: List[str] = Field(default_factory=list)  # admite ["Spain","Portugal"] o ["ES","PT"]
     manufacturers_only: bool = True
     max_pages: int = 20
     timeout_ms: int = 25000
@@ -35,10 +34,6 @@ def health():
 
 
 def _normalize_countries(countries: List[str]) -> List[str]:
-    """
-    Normaliza códigos típicos a nombres que usa el facet de Easyfairs.
-    Ajustable según el catálogo.
-    """
     if not countries:
         return ["Spain", "Portugal"]
 
@@ -53,8 +48,8 @@ def _normalize_countries(countries: List[str]) -> List[str]:
         elif u in ("PT", "PRT", "PORTUGAL"):
             out.append("Portugal")
         else:
-            # si ya viene en formato correcto ("Spain", "Portugal", etc.)
             out.append(cc)
+
     # dedupe
     seen = set()
     uniq = []
@@ -69,48 +64,41 @@ def _normalize_countries(countries: List[str]) -> List[str]:
 def scrape(req: ScrapeRequest):
     url = str(req.url)
 
-    if is_easyfairs_supported(url):
-        container_id = get_container_id_for_url(url)
-        if not container_id:
-            raise HTTPException(
-                status_code=400,
-                detail="URL parece Easyfairs, pero no hay containerId en el mapping. Añádelo a EASYFAIRS_CONTAINER_MAP.",
-            )
+    # Detecta Easyfairs por mapping dominio->containerId
+    container_id = get_container_id_for_url(url)
+    if container_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Esta URL no está en el mapping Easyfairs. "
+                "Si es otra feria Easyfairs, añade el dominio->containerId en EASYFAIRS_CONTAINER_MAP."
+            ),
+        )
 
-        countries_norm = _normalize_countries(req.countries)
+    countries_norm = _normalize_countries(req.countries)
 
-        try:
-            rows, meta = fetch_easyfairs_stands_by_countries(
-                event_url=url,
-                container_id=container_id,
-                countries=countries_norm,
-                lang="es",
-                query_seed="a",
-                hits_per_page=100,
-                timeout_s=max(5, int(req.timeout_ms / 1000)),
-                max_pages=req.max_pages if req.max_pages > 0 else None,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Easyfairs widgets scrape failed: {e}")
+    try:
+        rows, meta = fetch_easyfairs_stands_by_countries(
+            event_url=url,
+            container_id=container_id,
+            countries=countries_norm,
+            lang="es",
+            query_seed="a",
+            hits_per_page=100,
+            timeout_s=max(5, int(req.timeout_ms / 1000)),
+            max_pages=req.max_pages if req.max_pages and req.max_pages > 0 else None,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Easyfairs widgets scrape failed: {e}")
 
-        out = []
-        for r in rows:
-            out.append(
-                {
-                    "fabricante": r.get("name", ""),
-                    "actividad": r.get("activity", ""),
-                    "enlace_web": r.get("website", ""),
-                    "pais": r.get("country", ""),
-                }
-            )
+    results = [
+        {
+            "fabricante": r.get("name", ""),
+            "actividad": r.get("activity", ""),
+            "enlace_web": r.get("website", ""),
+            "pais": r.get("country", ""),  # <- aquí ya debe venir Spain/Portugal por el filtro
+        }
+        for r in rows
+    ]
 
-        return ScrapeResponse(url=url, total=len(out), results=out, meta=meta)
-
-    raise HTTPException(
-        status_code=400,
-        detail=(
-            "Esta URL no está en el mapping Easyfairs. "
-            "Si es otra feria Easyfairs, añade el dominio->containerId. "
-            "Si es otro tipo de directorio, implementa el scraper correspondiente."
-        ),
-    )
+    return ScrapeResponse(url=url, total=len(results), results=results, meta=meta)
