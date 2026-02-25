@@ -1,94 +1,110 @@
 # easyfairs_widgets.py
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
-
+import re
 import requests
 
-# ------------------------------------------------------------
-# Ajusta aquí el mapping dominio -> containerId
-# (este dato lo sacas del payload en Network: filters "(containerId: 2653)")
-# ------------------------------------------------------------
+
+# =========================================================
+# 1) Mapping dominio -> containerId
+#    Añade aquí más ferias Easyfairs si las necesitas
+# =========================================================
 EASYFAIRS_CONTAINER_MAP: Dict[str, int] = {
     "www.logisticsautomationmadrid.com": 2653,
     "logisticsautomationmadrid.com": 2653,
 }
 
-# Endpoint que has capturado en Network
-EASYFAIRS_WIDGETS_API = "https://my.easyfairs.com/widgets/api/stands/"
 
-
-def is_easyfairs_supported(url: str) -> bool:
+# =========================================================
+# 2) Detección y helpers
+# =========================================================
+def is_easyfairs_supported(event_url: str) -> bool:
     """
-    Devuelve True si el dominio está en el mapping.
+    Devuelve True si el dominio está en el mapping y parece un catálogo Easyfairs.
     """
-    host = (urlparse(url).netloc or "").lower()
+    try:
+        host = (urlparse(event_url).netloc or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
     return host in EASYFAIRS_CONTAINER_MAP
 
 
-def get_container_id_for_url(url: str) -> Optional[int]:
-    """
-    Devuelve containerId según el dominio.
-    """
-    host = (urlparse(url).netloc or "").lower()
+def get_container_id_for_url(event_url: str) -> Optional[int]:
+    try:
+        host = (urlparse(event_url).netloc or "").lower()
+    except Exception:
+        return None
     return EASYFAIRS_CONTAINER_MAP.get(host)
 
 
-def _post_widgets_query(
-    *,
-    container_id: int,
-    lang: str,
-    query: str,
-    hits_per_page: int,
-    page: int,
-    timeout_s: int,
-    country: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Llama al endpoint /widgets/api/stands/?language=es con el formato de "multiple queries"
-    que has visto en DevTools.
+# =========================================================
+# 3) Scrape vía endpoint widgets (my.easyfairs.com)
+# =========================================================
+EASYFAIRS_WIDGETS_ENDPOINT = "https://my.easyfairs.com/widgets/api/stands/?language={lang}"
 
-    Nota:
-    - El backend parece compatible con estilo Algolia.
-    - Para filtrar país, intentamos facetFilters si lo acepta.
-      Si no lo aceptara en algún evento, se puede filtrar en cliente por hits[].country.
-    """
-    params_obj: Dict[str, Any] = {
-        "facets": ["categories.name", "country"],
-        "filters": f"(containerId: {container_id})",
-        "highlightPostTag": "__/ais-highlight__",
-        "highlightPreTag": "__ais-highlight__",
-        "hitsPerPage": hits_per_page,
-        "maxValuesPerFacet": 100,
-        "page": page,
-        "query": query,
-    }
+DEFAULT_HEADERS = {
+    "accept": "*/*",
+    "content-type": "application/json",
+    "origin": "https://www.logisticsautomationmadrid.com",
+    "referer": "https://www.logisticsautomationmadrid.com/",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+}
 
-    # Intento de filtro por país (si el backend lo soporta)
+
+_url_re = re.compile(r"(https?://[^\s)]+|www\.[^\s)]+)", re.IGNORECASE)
+
+
+def _extract_website_from_text(text: str) -> str:
+    if not text:
+        return ""
+    m = _url_re.search(text)
+    if not m:
+        return ""
+    u = m.group(0).strip().rstrip(".,;")
+    if u.lower().startswith("www."):
+        u = "https://" + u
+    return u
+
+
+def _activity_from_hit(hit: Dict[str, Any], lang: str) -> str:
+    cats = hit.get("categories") or []
+    names: List[str] = []
+    for c in cats:
+        nm = (c.get("name") or {}).get(lang) or (c.get("name") or {}).get("en") or ""
+        nm = (nm or "").strip()
+        if nm:
+            names.append(nm)
+    # dedupe manteniendo orden
+    seen = set()
+    out = []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+    return ", ".join(out)
+
+
+def _build_algolia_filters(container_id: int, country: Optional[str]) -> str:
+    """
+    Easyfairs usa un backend tipo Algolia. El ejemplo que me pasaste usa:
+    filters="(containerId: 2653)"
+    y facet 'country' con valores 'Spain', 'Portugal', etc.
+
+    Para filtrar por país, añadimos: AND country:"Spain"
+    """
+    base = f"(containerId: {container_id})"
     if country:
-        # Algolia suele aceptar facetFilters como lista
-        params_obj["facetFilters"] = [f"country:{country}"]
-
-    payload = [{"indexName": "stands_relevance", "params": params_obj}]
-
-    r = requests.post(
-        f"{EASYFAIRS_WIDGETS_API}?language={lang}",
-        json=payload,
-        timeout=timeout_s,
-        headers={
-            "Accept": "*/*",
-            "Content-Type": "application/json",
-            # "Origin" y "Referer" no suelen ser necesarios desde servidor,
-            # pero si algún evento lo exige, se pueden añadir.
-        },
-    )
-    r.raise_for_status()
-    return r.json()
+        # IMPORTANTE: comillas para valores con espacios
+        base += f' AND country:"{country}"'
+    return base
 
 
 def fetch_easyfairs_stands_by_countries(
-    *,
     event_url: str,
     container_id: int,
     countries: List[str],
@@ -96,120 +112,115 @@ def fetch_easyfairs_stands_by_countries(
     query_seed: str = "a",
     hits_per_page: int = 100,
     timeout_s: int = 25,
-    max_pages: Optional[int] = None,
+    max_pages: Optional[int] = 20,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Devuelve lista de stands (deduplicada por objectID) filtrada por países.
+    Devuelve:
+      rows: lista de dicts con name/activity/website/country/objectID
+      meta: info de paginación, hits reportados, etc.
 
-    Retorna:
-      rows: [{objectID, name, activity, website, country, ...}]
-      meta: info de depuración
+    Nota: el endpoint devuelve 'nbHits' y 'nbPages'. Con hits_per_page alto,
+    normalmente te lo saca en 1 página por país si hay menos de 100.
     """
-    all_rows: List[Dict[str, Any]] = []
-    seen_ids: set[str] = set()
+    if not countries:
+        countries = ["Spain", "Portugal"]
 
+    endpoint = EASYFAIRS_WIDGETS_ENDPOINT.format(lang=lang)
+
+    rows: List[Dict[str, Any]] = []
     hits_reported_by_country: Dict[str, int] = {}
     pages_fetched_by_country: Dict[str, int] = {}
+
+    session = requests.Session()
 
     for country in countries:
         page = 0
         fetched_pages = 0
-        total_hits_reported: Optional[int] = None
 
         while True:
             if max_pages is not None and fetched_pages >= max_pages:
                 break
 
-            data = _post_widgets_query(
-                container_id=container_id,
-                lang=lang,
-                query=query_seed,
-                hits_per_page=hits_per_page,
-                page=page,
-                timeout_s=timeout_s,
-                country=country,
+            payload = [
+                {
+                    "indexName": "stands_relevance",
+                    "params": {
+                        "facets": ["categories.name", "country"],
+                        "filters": _build_algolia_filters(container_id, country),
+                        "highlightPostTag": "__/ais-highlight__",
+                        "highlightPreTag": "__ais-highlight__",
+                        "hitsPerPage": int(hits_per_page),
+                        "maxValuesPerFacet": 100,
+                        "page": int(page),
+                        "query": str(query_seed),
+                    },
+                }
+            ]
+
+            r = session.post(
+                endpoint,
+                json=payload,
+                headers=DEFAULT_HEADERS,
+                timeout=timeout_s,
             )
 
+            # Si Easyfairs devuelve 403/429 etc, queremos verlo claro
+            if r.status_code >= 400:
+                body_preview = (r.text or "")[:800]
+                raise RuntimeError(
+                    f"Easyfairs widgets HTTP {r.status_code}. Body: {body_preview}"
+                )
+
+            data = r.json() or {}
             results = data.get("results") or []
             if not results:
                 break
 
-            first = results[0]
-            hits = first.get("hits") or []
+            block = results[0]
+            nb_hits = int(block.get("nbHits") or 0)
+            nb_pages = int(block.get("nbPages") or 0)
+            hits_reported_by_country[country] = nb_hits
 
-            # Guardamos nbHits si aparece
-            if total_hits_reported is None:
-                nb_hits = first.get("nbHits")
-                if isinstance(nb_hits, int):
-                    total_hits_reported = nb_hits
+            hits = block.get("hits") or []
+            for hit in hits:
+                name = (hit.get("name") or "").strip()
+                ctry = (hit.get("country") or "").strip() or country
+                activity = _activity_from_hit(hit, lang=lang)
+                website = (hit.get("website") or "").strip()
 
-            # Si el filtro por país no funcionó en servidor, filtramos aquí por seguridad
-            filtered_hits = []
-            for h in hits:
-                h_country = h.get("country") or ""
-                if not country or h_country == country:
-                    filtered_hits.append(h)
+                # A veces no viene 'website', intentamos extraerlo de la descripción
+                if not website:
+                    desc = hit.get("description") or {}
+                    desc_text = (desc.get(lang) or desc.get("en") or "").strip()
+                    website = _extract_website_from_text(desc_text)
 
-            for h in filtered_hits:
-                oid = str(h.get("objectID") or "")
-                if not oid:
-                    continue
-                if oid in seen_ids:
-                    continue
-                seen_ids.add(oid)
-
-                name = h.get("name") or ""
-                cats = h.get("categories") or []
-                cat_names: List[str] = []
-                for c in cats:
-                    # c["name"] puede ser dict con "es"/"en"
-                    nm = (c.get("name") or {})
-                    if isinstance(nm, dict):
-                        cat_names.append(nm.get(lang) or nm.get("en") or "")
-                    elif isinstance(nm, str):
-                        cat_names.append(nm)
-                activity = ", ".join([x for x in cat_names if x])
-
-                # Website: a veces viene en description o no viene.
-                website = h.get("website") or ""
-                # Country:
-                h_country = h.get("country") or country or ""
-
-                all_rows.append(
+                rows.append(
                     {
-                        "objectID": oid,
+                        "objectID": hit.get("objectID"),
                         "name": name,
                         "activity": activity,
                         "website": website,
-                        "country": h_country,
-                        "raw": h,
+                        "country": ctry,
                     }
                 )
 
             fetched_pages += 1
+            pages_fetched_by_country[country] = fetched_pages
+
             page += 1
-
-            # Cortes por fin de paginación
-            nb_pages = first.get("nbPages")
-            if isinstance(nb_pages, int) and page >= nb_pages:
+            if nb_pages <= 0 or page >= nb_pages:
                 break
 
-            # Si no hay hits, fin
-            if not hits:
-                break
-
-        # Meta por país
-        if total_hits_reported is None:
-            # Intento alternativo: facets['country'][country]
-            try:
-                facets = (results[0].get("facets") or {}).get("country") or {}
-                if isinstance(facets, dict) and country in facets:
-                    total_hits_reported = int(facets[country])
-            except Exception:
-                pass
-
-        hits_reported_by_country[country] = int(total_hits_reported or 0)
-        pages_fetched_by_country[country] = fetched_pages
+    # dedupe por objectID manteniendo orden
+    seen = set()
+    deduped: List[Dict[str, Any]] = []
+    for r in rows:
+        oid = r.get("objectID")
+        key = oid if oid is not None else (r.get("name"), r.get("country"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
 
     meta = {
         "source": "easyfairs_widgets",
@@ -221,19 +232,4 @@ def fetch_easyfairs_stands_by_countries(
         "pages_fetched_by_country": pages_fetched_by_country,
         "dedupe_by_objectID": True,
     }
-
-    # quitamos raw para devolver limpio si quieres (pero lo dejamos aquí por si haces debug)
-    # Si prefieres sin raw:
-    cleaned: List[Dict[str, Any]] = []
-    for r in all_rows:
-        cleaned.append(
-            {
-                "objectID": r["objectID"],
-                "name": r["name"],
-                "activity": r["activity"],
-                "website": r["website"],
-                "country": r["country"],
-            }
-        )
-
-    return cleaned, meta
+    return deduped, meta
