@@ -1,5 +1,7 @@
 # main.py
-from typing import List, Optional, Any, Dict, Tuple
+from __future__ import annotations
+
+from typing import List, Any, Dict, Optional, Tuple
 from io import BytesIO
 
 from fastapi import FastAPI, HTTPException
@@ -17,7 +19,7 @@ from easyfairs_widgets import (
     fetch_easyfairs_stands_by_countries,
 )
 
-app = FastAPI(title="Fair Scraper API", version="1.2.0")
+app = FastAPI(title="Fair Scraper API", version="1.2.1")
 
 
 class ScrapeRequest(BaseModel):
@@ -60,7 +62,7 @@ def _normalize_countries(countries: List[str]) -> List[str]:
             out.append(cc)
 
     seen = set()
-    uniq = []
+    uniq: List[str] = []
     for x in out:
         if x not in seen:
             seen.add(x)
@@ -85,12 +87,14 @@ def _build_excel(results: List[Dict[str, Any]], url: str) -> bytes:
     headers = ["Fabricante", "Actividad", "Enlace Web", "País"]
     ws.append(headers)
 
+    # Cabecera en negrita y centrada
     header_font = Font(bold=True)
     for col in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=col)
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
+    # Datos
     for item in sorted_results:
         ws.append(
             [
@@ -107,7 +111,6 @@ def _build_excel(results: List[Dict[str, Any]], url: str) -> bytes:
     # Tabla estructurada
     table_ref = f"A1:{get_column_letter(last_col)}{last_row}"
     table = Table(displayName="EmpresasTable", ref=table_ref)
-
     style = TableStyleInfo(
         name="TableStyleMedium9",
         showFirstColumn=False,
@@ -118,7 +121,7 @@ def _build_excel(results: List[Dict[str, Any]], url: str) -> bytes:
     table.tableStyleInfo = style
     ws.add_table(table)
 
-    # Freeze
+    # Freeze pane
     ws.freeze_panes = "A2"
 
     # Auto ancho columnas
@@ -127,11 +130,11 @@ def _build_excel(results: List[Dict[str, Any]], url: str) -> bytes:
         col_letter = get_column_letter(col)
         for row in range(1, last_row + 1):
             val = ws.cell(row=row, column=col).value
-            if val is not None:
+            if val:
                 max_len = max(max_len, len(str(val)))
         ws.column_dimensions[col_letter].width = min(max_len + 3, 60)
 
-    # Hoja meta
+    # Hoja Meta
     ws2 = wb.create_sheet("Meta")
     ws2.append(["Campo", "Valor"])
     ws2["A1"].font = header_font
@@ -144,35 +147,32 @@ def _build_excel(results: List[Dict[str, Any]], url: str) -> bytes:
     return bio.getvalue()
 
 
-def _scrape_easyfairs(url: str, req: ScrapeRequest) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _scrape_easyfairs(req: ScrapeRequest) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    url = str(req.url)
+
     if not is_easyfairs_supported(url):
         raise HTTPException(
             status_code=400,
-            detail="Esta URL no está soportada en EASYFAIRS_CONTAINER_MAP.",
+            detail="Esta URL no está soportada (no está en EASYFAIRS_CONTAINER_MAP).",
         )
 
     container_id = get_container_id_for_url(url)
     if not container_id:
-        raise HTTPException(
-            status_code=400,
-            detail="URL parece Easyfairs, pero no hay containerId en el mapping.",
-        )
+        raise HTTPException(status_code=400, detail="No hay containerId para este dominio.")
 
     countries_norm = _normalize_countries(req.countries)
+    timeout_s = max(5, int(req.timeout_ms / 1000))
 
-    try:
-        rows, meta = fetch_easyfairs_stands_by_countries(
-            event_url=url,
-            container_id=container_id,
-            countries=countries_norm,
-            lang="es",
-            query_seed="a",
-            hits_per_page=100,
-            timeout_s=max(5, int(req.timeout_ms / 1000)),
-            max_pages=req.max_pages if req.max_pages > 0 else None,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Easyfairs widgets scrape failed: {e}")
+    rows, meta = fetch_easyfairs_stands_by_countries(
+        event_url=url,
+        container_id=container_id,
+        countries=countries_norm,
+        lang="es",
+        query_seed="a",
+        hits_per_page=100,
+        timeout_s=timeout_s,
+        max_pages=req.max_pages if req.max_pages > 0 else None,
+    )
 
     results: List[Dict[str, Any]] = []
     for r in rows:
@@ -190,20 +190,14 @@ def _scrape_easyfairs(url: str, req: ScrapeRequest) -> Tuple[List[Dict[str, Any]
 
 @app.post("/scrape_json", response_model=ScrapeResponse)
 def scrape_json(req: ScrapeRequest):
-    url = str(req.url)
-    results, meta = _scrape_easyfairs(url, req)
-    return ScrapeResponse(url=url, total=len(results), results=results, meta=meta)
+    results, meta = _scrape_easyfairs(req)
+    return ScrapeResponse(url=str(req.url), total=len(results), results=results, meta=meta)
 
 
 @app.post("/scrape")
-def scrape(req: ScrapeRequest):
-    """
-    Devuelve SIEMPRE un Excel (application/vnd.openxmlformats-officedocument.spreadsheetml.sheet)
-    """
-    url = str(req.url)
-    results, _meta = _scrape_easyfairs(url, req)
-
-    xlsx_bytes = _build_excel(results=results, url=url)
+def scrape_excel(req: ScrapeRequest):
+    results, _meta = _scrape_easyfairs(req)
+    xlsx_bytes = _build_excel(results, url=str(req.url))
 
     filename = "fabricantes_es_pt.xlsx"
     return StreamingResponse(
