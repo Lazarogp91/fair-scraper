@@ -5,8 +5,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
-COPY easyfairs_widgets.py .
+# Copia el código (main.py + easyfairs_widgets.py + lo que haya)
+COPY . .
 
 ENV PYTHONUNBUFFERED=1
 
