@@ -1,3 +1,7 @@
+from typing import List, Dict, Any
+from io import BytesIO
+
+from openpyxl import Workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
@@ -64,7 +68,7 @@ def _build_excel(results: List[Dict[str, Any]], url: str) -> bytes:
         col_letter = get_column_letter(col)
         for row in range(1, last_row + 1):
             val = ws.cell(row=row, column=col).value
-            if val:
+            if val is not None:
                 max_len = max(max_len, len(str(val)))
         ws.column_dimensions[col_letter].width = min(max_len + 3, 60)
 
