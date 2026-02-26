@@ -191,3 +191,23 @@ def scrape_excel(req: ScrapeRequest):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+    # ---- Hoja Resumen Comercial ----
+    ws3 = wb.create_sheet("Resumen")
+
+    ws3.append(["Métrica", "Valor"])
+    ws3["A1"].font = header_font
+    ws3["B1"].font = header_font
+
+    total = len(sorted_results)
+    ws3.append(["Total empresas", total])
+
+    # Conteo por país
+    country_count = {}
+    for r in sorted_results:
+        c = r.get("pais", "Unknown")
+        country_count[c] = country_count.get(c, 0) + 1
+
+    ws3.append([])
+    ws3.append(["Empresas por país", ""])
+    for c, count in country_count.items():
+        ws3.append([c, count])
