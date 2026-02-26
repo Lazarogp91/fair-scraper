@@ -213,4 +213,8 @@ def scrape_any(url: str, cfg: ScrapeConfig) -> Tuple[List[Row], Meta]:
         "attempts": [meta, meta2],
         "host": _host(url),
     }
+    # 3) Playwright fallback (JS dinámico)
+    res3, meta3 = scrape_with_playwright(url, timeout_s=cfg.timeout_s)
+    if res3:
+        return res3, meta3
     return [], meta_out
