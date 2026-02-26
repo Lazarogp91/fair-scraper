@@ -1,4 +1,5 @@
 # scrapers.py
+from playwright_scraper import scrape_with_playwright
 from __future__ import annotations
 
 from dataclasses import dataclass
