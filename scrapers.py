@@ -1,7 +1,6 @@
+from __future__ import annotations
 # scrapers.py
 from playwright_scraper import scrape_with_playwright
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
